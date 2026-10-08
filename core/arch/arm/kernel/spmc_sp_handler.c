@@ -251,21 +251,20 @@ err:
 }
 
 static int spmc_sp_add_nw_region(struct sp_mem *smem,
-				 struct ffa_mem_region *mem_reg)
+				 struct ffa_mem_region *mem_reg,
+				 size_t addr_range_cnt, size_t total_page_count)
 {
-	uint64_t page_count = READ_ONCE(mem_reg->total_page_count);
 	struct sp_mem_map_region *region = NULL;
-	struct mobj *m = sp_mem_new_mobj(page_count, TEE_MATTR_MEM_TYPE_CACHED,
-					 false);
+	struct mobj *m = sp_mem_new_mobj(total_page_count,
+					 TEE_MATTR_MEM_TYPE_CACHED, false);
 	unsigned int i = 0;
 	unsigned int idx = 0;
 	int res = FFA_OK;
-	uint64_t address_count = READ_ONCE(mem_reg->address_range_count);
 
 	if (!m)
 		return FFA_NO_MEMORY;
 
-	for (i = 0; i < address_count; i++) {
+	for (i = 0; i < addr_range_cnt; i++) {
 		struct ffa_address_range *addr_range = NULL;
 
 		addr_range = &mem_reg->address_range_array[i];
@@ -284,7 +283,7 @@ static int spmc_sp_add_nw_region(struct sp_mem *smem,
 	}
 
 	region->mobj = m;
-	region->page_count = page_count;
+	region->page_count = total_page_count;
 
 	if (!sp_has_exclusive_access(region, NULL)) {
 		free(region);
@@ -429,7 +428,8 @@ int spmc_sp_add_share(struct ffa_mem_transaction_x *mem_trans,
 				goto cleanup;
 		}
 	} else {
-		res = spmc_sp_add_nw_region(smem, mem_reg);
+		res = spmc_sp_add_nw_region(smem, mem_reg, addr_range_cnt,
+					    total_page_count);
 		if (res)
 			goto cleanup;
 	}
@@ -695,6 +695,10 @@ static void ffa_mem_retrieve(struct thread_smc_1_2_regs *args,
 	}
 
 	receiver = sp_mem_get_receiver(caller_sp->endpoint_id, smem);
+	if (!receiver) {
+		ret = FFA_DENIED;
+		goto err_unlock;
+	}
 
 	mem_acc = (void *)((vaddr_t)rxtx->rx + mem_trans.mem_access_offs);
 	address_offset = READ_ONCE(mem_acc->region_offs);
@@ -805,6 +809,11 @@ static void ffa_mem_relinquish(struct thread_smc_1_2_regs *args,
 	cpu_spin_unlock_xrestore(&rxtx->spinlock, exceptions);
 
 	receiver = sp_mem_get_receiver(caller_sp->endpoint_id, smem);
+	if (!receiver) {
+		sp_mem_read_unlock(smem);
+		ffa_set_error(args, FFA_DENIED);
+		return;
+	}
 
 	exceptions = cpu_spin_lock_xsave(&mem_ref_lock);
 	if (!receiver->ref_count) {
@@ -1202,6 +1211,35 @@ static struct sp_session *
 ffa_handle_sp_error(struct thread_smc_1_2_regs *args,
 		    struct sp_session *caller_sp)
 {
+	struct sp_session *dst = NULL;
+	TEE_Result res = FFA_OK;
+
+	if (caller_sp && caller_sp->caller_fid) {
+		/*
+		 * FFA_ERROR has no endpoint address, use the saved direct
+		 * caller.
+		 */
+		dst = sp_get_session(caller_sp->caller_id);
+
+		caller_sp->caller_id = 0;
+		caller_sp->caller_fid = 0;
+
+		cpu_spin_lock(&caller_sp->spinlock);
+		caller_sp->state = sp_idle;
+		cpu_spin_unlock(&caller_sp->spinlock);
+
+		if (!dst)
+			return NULL;
+
+		res = sp_enter(args, dst);
+		if (res) {
+			ffa_set_error(args, FFA_ABORTED);
+			return caller_sp;
+		}
+
+		return dst;
+	}
+
 	/* If caller_sp == NULL send message to Normal World */
 	if (caller_sp && sp_enter(args, caller_sp)) {
 		/*
@@ -1425,6 +1463,8 @@ out:
 void spmc_sp_msg_handler(struct thread_smc_1_2_regs *args,
 			 struct sp_session *caller_sp)
 {
+	struct sp_ctx *ctx = NULL;
+
 	thread_check_canaries();
 	do {
 		switch (args->a0) {
@@ -1456,8 +1496,10 @@ void spmc_sp_msg_handler(struct thread_smc_1_2_regs *args,
 		case FFA_RXTX_MAP_64:
 #endif
 		case FFA_RXTX_MAP_32:
+			ctx = to_sp_ctx(caller_sp->ts_sess.ctx);
 			ts_push_current_session(&caller_sp->ts_sess);
-			spmc_handle_rxtx_map(args, &caller_sp->rxtx);
+			spmc_handle_rxtx_map(args, &caller_sp->rxtx,
+					     &ctx->uctx);
 			ts_pop_current_session();
 			sp_enter(args, caller_sp);
 			break;

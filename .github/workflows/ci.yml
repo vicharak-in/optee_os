@@ -217,9 +217,12 @@ jobs:
               _make PLATFORM=qcom-kodiak
               _make PLATFORM=qcom-lemans
               _make PLATFORM=qcom-lemans CFG_QCOM_DIAG_LOG=y CFG_QFPROM_PROGRAMMING=y CFG_QCOM_QFPROM_FUSEPROV=y
+              _make PLATFORM=qcom-monaco
               _make PLATFORM=qcom-ipq96xx
               _make PLATFORM=qcom-ipq52xx
               _make PLATFORM=qcom-nord
+              _make PLATFORM=qcom-shikra
+              _make PLATFORM=qcom-cacao
           - name: arm rockchip
             make_commands: |
               _make PLATFORM=rockchip-px30
@@ -352,6 +355,7 @@ jobs:
               _make PLATFORM=virt
               _make PLATFORM=virt CFG_RISCV_PLIC=n CFG_RISCV_APLIC=y
               _make PLATFORM=virt CFG_RISCV_PLIC=n CFG_RISCV_APLIC_MSI=y CFG_RISCV_IMSIC=y
+              _make PLATFORM=virt CFG_RISCV_ISA_ZICBOM=y
               _make PLATFORM=sifive
               _make PLATFORM=cva6
     steps:
@@ -470,6 +474,7 @@ jobs:
               export BR2_CCACHE_DIR=/root/.cache/ccache
               export FORCE_UNSAFE_CONFIGURE=1
               export CFG_TEE_CORE_LOG_LEVEL=2
+              export DUMP_LOGS_ON_ERROR=1
 
               TOP=/root/optee_repo_qemu
               mv $TOP/optee_os $TOP/optee_os_old
@@ -610,6 +615,7 @@ jobs:
               export CFG_TEE_CORE_LOG_LEVEL=2
               export CFG_ATTESTATION_PTA=y
               export CFG_ATTESTATION_PTA_KEY_SIZE=1024
+              export DUMP_LOGS_ON_ERROR=1
 
               TOP=/root/optee_repo_qemu_v8
               mv $TOP/optee_os $TOP/optee_os_old
@@ -695,6 +701,7 @@ jobs:
               export CFG_TEE_CORE_LOG_LEVEL=2
               export CFG_ATTESTATION_PTA=y
               export CFG_ATTESTATION_PTA_KEY_SIZE=1024
+              export DUMP_LOGS_ON_ERROR=1
 
               TOP=/root/optee_repo_qemu_v8
               mv $TOP/optee_os $TOP/optee_os_old

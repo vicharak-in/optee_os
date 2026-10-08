@@ -107,6 +107,12 @@ R:	Clement Leger <clement.leger@bootlin.com> [@clementleger]
 S:	Maintained
 F:	core/drivers/clk/
 
+Qualcomm Clock driver framework
+R:	Naresh Nunna <nnunna@qti.qualcomm.com> [@nnunna94]
+S:	Maintained
+F:	core/drivers/clk/qcom/
+F:	core/include/drivers/clk_qcom.h
+
 Core Drivers I2C
 R:	Jorge Ramirez <jorge@foundries.io> [@ldts]
 R:	Sahil Malhotra <sahil.malhotra@nxp.com> [@sahilnxp]
@@ -141,7 +147,8 @@ F:	core/drivers/versal_sha3_384.c
 F:	core/drivers/versal_trng.c
 
 Core Drivers QCOM CMD_DB
-R:	Selvam Sathappan Periakaruppan <speriaka@qti.qualcomm.com> [@zelvam95]
+R:	Selvam Sathappan Periakaruppan <selvam.periakaruppan@oss.qualcomm.com> [@zelvam95]
+R:	Dinesh Choudhary <idinesh@qti.qualcomm.com> [@IDineshChoudhary]
 S:	Maintained
 F:	core/drivers/qcom/cmd_db/
 F:	core/include/drivers/qcom/cmd_db/
@@ -152,17 +159,39 @@ S:	Maintained
 F:	core/drivers/crypto/qcom/
 
 Core Drivers QCOM QFPROM
-R:	Selvam Sathappan Periakaruppan <speriaka@qti.qualcomm.com> [@zelvam95]
+R:	Selvam Sathappan Periakaruppan <selvam.periakaruppan@oss.qualcomm.com> [@zelvam95]
 R:	Kishore Batta <kishore.batta@oss.qualcomm.com> [@kishorebatta-ossqcom]
 S:	Maintained
 F:	core/drivers/qcom/qfprom/
 F:	core/include/drivers/qcom/qfprom/
 
 Core Drivers QCOM RPMH
-R:	Selvam Sathappan Periakaruppan <speriaka@qti.qualcomm.com> [@zelvam95]
+R:	Selvam Sathappan Periakaruppan <selvam.periakaruppan@oss.qualcomm.com> [@zelvam95]
+R:	Dinesh Choudhary <idinesh@qti.qualcomm.com> [@IDineshChoudhary]
 S:	Maintained
 F:	core/drivers/qcom/rpmh/
 F:	core/include/drivers/qcom/rpmh/
+
+Core Drivers QCOM TLMM
+R:	Siva Rama Krishna Potu <spotu@qti.qualcomm.com> [@siva-potu]
+R:	Vinod Kumar Amanaganti <vinoda@qti.qualcomm.com> [@vinod-amanaganti]
+S:	Maintained
+F:	core/drivers/qcom/tlmm/
+F:	core/include/drivers/qcom/tlmm/
+
+Core Drivers QCOM WDT
+R:	Harikrishna <hart@qti.qualcomm.com> [@thariaruchamy-bit]
+R:	Selvam Sathappan Periakaruppan <selvam.periakaruppan@oss.qualcomm.com> [@zelvam95]
+S:	Maintained
+F:	core/drivers/qcom/wdt/
+
+Core Drivers QCOM XPU
+R:	Harikrishna <hart@qti.qualcomm.com> [@thariaruchamy-bit]
+R:	Selvam Sathappan Periakaruppan <selvam.periakaruppan@oss.qualcomm.com> [@zelvam95]
+S:	Maintained
+F:	core/arch/arm/plat-qcom/xpu_policy.c
+F:	core/drivers/qcom/xpu/
+F:	core/include/drivers/qcom/xpu*
 
 Core Drivers ZYNQMP
 R:	Jorge Ramirez <jorge@foundries.io> [@ldts]
@@ -292,14 +321,23 @@ F:	core/pta/qcom/
 F:	ta/qcom_pas/
 
 Qualcomm Bobcat Arch
-R:	Selvam Sathappan Periakaruppan <speriaka@qti.qualcomm.com> [@zelvam95]
+R:	Selvam Sathappan Periakaruppan <selvam.periakaruppan@oss.qualcomm.com> [@zelvam95]
 S:	Maintained
 F:	core/arch/arm/plat-qcom/bobcat/
 
 Qualcomm Fuse Provisioning
-R:	Selvam Sathappan Periakaruppan <speriaka@qti.qualcomm.com> [@zelvam95]
+R:	Selvam Sathappan Periakaruppan <selvam.periakaruppan@oss.qualcomm.com> [@zelvam95]
 S:	Maintained
 F:	core/arch/arm/plat-qcom/provision/
+
+Qualcomm PAS Authentication
+R:	Selvam Sathappan Periakaruppan <selvam.periakaruppan@oss.qualcomm.com> [@zelvam95]
+S:	Maintained
+F:	core/pta/qcom/fuse/
+F:	core/pta/qcom/pas/pas_auth.c
+F:	lib/libutee/include/pta_qcom_fuse.h
+F:	ta/qcom_pas/include/auth/
+F:	ta/qcom_pas/src/auth/
 
 Raspberry Pi3
 R:	Joakim Bech <joakim.bech@gmail.com> [@jockebech]
@@ -316,6 +354,11 @@ Renesas RCAR
 R:	Volodymyr Babchuk <vlad.babchuk@gmail.com> [@lorc]
 S:	Maintained
 F:	core/arch/arm/plat-rcar/
+
+Renesas RCAR Gen5
+R:	Marek Vasut <marek.vasut+renesas@mailbox.org> [@marex]
+S:	Maintained
+F:	core/arch/arm/plat-rcar_gen5/
 
 Renesas RZ/G2
 R:	Lad Prabhakar <prabhakar.mahadev-lad.rj@bp.renesas.com> [@prabhakarlad]

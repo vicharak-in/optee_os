@@ -6,6 +6,7 @@
 
 #include <assert.h>
 #include <drivers/amd/asu_client.h>
+#include <drivers/amd/fw_compat.h>
 #include <initcall.h>
 #include <io.h>
 #include <kernel/delay.h>
@@ -281,7 +282,7 @@ TEE_Result asu_update_queue_buffer_n_send_ipi(struct asu_client_params *param,
 		return TEE_ERROR_BAD_PARAMETERS;
 	}
 
-	if (asu->is_ready != ASU_CLIENT_READY) {
+	if (!asu || asu->is_ready != ASU_CLIENT_READY) {
 		EMSG("ASU client is not ready");
 		return TEE_ERROR_BAD_STATE;
 	}
@@ -493,6 +494,8 @@ static TEE_Result asu_init(void)
 	asu->p0_last_index = ASU_MAX_BUFFERS - 1;
 	asu->p1_last_index = ASU_MAX_BUFFERS - 1;
 
+	fw_compat_check();
+
 	IMSG("ASU initialization complete");
 
 	return TEE_SUCCESS;
@@ -505,6 +508,7 @@ global_unmap:
 				ASU_BASEADDR_SIZE);
 free:
 	free(asu);
+	asu = NULL;
 
 	EMSG("Failed to initialize ASU");
 

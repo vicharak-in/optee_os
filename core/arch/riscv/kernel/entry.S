@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * Copyright (c) 2023 Andes Technology Corporation
- * Copyright 2022-2023 NXP
+ * Copyright 2022-2023,2026 NXP
  */
 
 #include <asm.S>
@@ -47,13 +47,13 @@
 
 .macro cpu_is_ready
 #ifdef CFG_BOOT_SYNC_CPU
-	csrr	t0, CSR_XSCRATCH
+	lw	t0, THREAD_CORE_LOCAL_HART_INDEX(tp)
 	lla	t1, sem_cpu_sync
 	slli	t0, t0, 2
 	add	t1, t1, t0
 	li	t2, SEM_CPU_READY
+	fence	rw, w
 	sw	t2, 0(t1)
-	fence
 #endif
 .endm
 
@@ -74,38 +74,30 @@
 	lla	t0, sem_cpu_sync
 	li	t2, SEM_CPU_READY
 1:
-	fence	w, w
 	lw	t1, 0(t0)
 	bne	t1, t2, 1b
+	fence	r, rw
 #endif
 .endm
 
 .macro wait_secondary
 #ifdef CFG_BOOT_SYNC_CPU
 	lla	t0, sem_cpu_sync
-	li	t1, CFG_TEE_CORE_NB_CORE
+	lla	t1, boot_hart_count
+	lw	t1, 0(t1)
 	li	t2, SEM_CPU_READY
 1:
 	addi	t1, t1, -1
 	beqz	t1, 3f
 	addi	t0, t0, 4
 2:
-	fence
-	lw	t1, 0(t0)
-	bne	t1, t2, 2b
+	lw	t3, 0(t0)
+	bne	t3, t2, 2b
+	fence	r, rw
 	j	1b
 3:
 #endif
 .endm
-
-#ifdef CFG_BOOT_SYNC_CPU
-#define flush_cpu_semaphores \
-		lla	t0, sem_cpu_sync_start
-		lla	t1, sem_cpu_sync_end
-		fence
-#else
-#define flush_cpu_semaphores
-#endif
 
 FUNC _start , :
 	/*
@@ -224,6 +216,17 @@ UNWIND(	.cantunwind)
 	sw	a0, THREAD_CORE_LOCAL_FLAGS(tp)
 #endif
 
+	/* Record the boot arguments, a0 = hart ID, a1 = device tree */
+	mv	a0, s0
+	mv	a1, s1
+	mv	a2, x0
+	mv	a3, x0
+	mv	a4, x0
+	jal	boot_save_args
+
+#ifdef CFG_RISCV_SBI
+	jal	sbi_init
+#endif
 	jal	plat_primary_init_early
 	jal	console_init
 
@@ -372,7 +375,6 @@ UNWIND(	.cantunwind)
 #endif
 
 	cpu_is_ready
-	flush_cpu_semaphores
 	wait_secondary
 
 	jal	thread_clr_boot_thread
@@ -409,9 +411,8 @@ UNWIND(	.cantunwind)
 	set_sp
 	set_tp
 #endif
-	cpu_is_ready
-
 	jal	boot_init_secondary
+	cpu_is_ready
 #ifdef CFG_RISCV_WITH_M_MODE_SM
 	/* Return to untrusted domain */
 	li	a0, TEEABI_OPTEED_RETURN_ON_DONE
@@ -521,15 +522,7 @@ LOCAL_DATA hart_lottery , :
 	.word	0
 END_DATA hart_lottery
 
-#ifdef CFG_BOOT_SYNC_CPU
-LOCAL_DATA sem_cpu_sync_start , :
-	.word	sem_cpu_sync
-END_DATA sem_cpu_sync_start
 
-LOCAL_DATA sem_cpu_sync_end , :
-	.word	sem_cpu_sync + (CFG_TEE_CORE_NB_CORE << 2)
-END_DATA sem_cpu_sync_end
-#endif
 
 #if !defined(CFG_DYN_CONFIG)
 LOCAL_DATA stack_tmp_rel , :

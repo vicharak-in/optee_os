@@ -59,6 +59,11 @@ CFG_TZDRAM_SIZE    ?= 0x8000000
 # device tree with additional nodes.
 CFG_DTB_MAX_SIZE ?= 0x200000
 
+# Reserved VA space for late/dynamic mappings (transfer list, ASU, etc.)
+# Default ARM value (10MB) is not enough once the transfer list (6MB) is
+# held mapped for most of boot alongside other dynamic IO_SEC mappings.
+CFG_RESERVED_VASPACE_SIZE ?= (24 * 1024 * 1024)
+
 # Console selection
 # 0 : UART0[pl011, pl011_0] (default)
 # 1 : UART1[pl011_1]
@@ -67,8 +72,13 @@ CFG_CONSOLE_UART ?= 0
 # PS GPIO Controller configuration.
 CFG_AMD_PS_GPIO ?= n
 
+# AMD PMC Specific config to check PMC FW version.
+CFG_AMD_PMC_SUPPORT ?= y
+
 # AMD ASU Specific configs
 CFG_AMD_ASU_SUPPORT ?= y
+
+ifeq ($(CFG_AMD_ASU_SUPPORT),y)
 CFG_AMD_APU_LCL_IPI_ID ?= 0x0004
 # Current HASH engine does not support partial state copy operation. Any
 # operation from REE involving state copy can crash the OS when driver
@@ -86,12 +96,20 @@ CFG_AMD_ASU_ECC ?= y
 
 # ASU TRNG driver configuration
 CFG_AMD_ASU_TRNG ?= y
-CFG_WITH_SOFTWARE_PRNG ?= n
 
-# HWRNG PTA configuration for Linux kernel integration
+# When ASU TRNG is enabled, use it as the RNG source and enable the HWRNG
+# PTA for Linux kernel integration. When it is disabled, leave
+# CFG_WITH_SOFTWARE_PRNG untouched so the generic default selects the
+# software PRNG automatically.
 ifeq ($(CFG_AMD_ASU_TRNG),y)
 CFG_HWRNG_PTA ?= y
 CFG_HWRNG_QUALITY ?= 1024
+
+# core/pta/hwrng.c only works with a hardware RNG; disable the software
+# PRNG whenever the HWRNG PTA is enabled.
+ifeq ($(CFG_HWRNG_PTA),y)
+$(call force,CFG_WITH_SOFTWARE_PRNG,n)
+endif
 endif
 
 ifeq ($(CFG_RPMB_FS),y)
@@ -114,6 +132,7 @@ $(warning WARNING: Any attempt by the REE to perform a state copy operation \
 # operations on the same underlying AES hardware engine, preventing
 # concurrent access.
 CFG_AMD_ASU_CMAC ?= n
+endif
 endif
 
 ifeq ($(CFG_AMD_PS_GPIO),y)

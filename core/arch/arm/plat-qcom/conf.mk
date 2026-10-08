@@ -33,9 +33,10 @@ ta-targets = ta_arm64
 supported-ta-targets ?= ta_arm64
 
 # Architecture family mapping
-HOYA_ARCH_CHIPSETS := kodiak lemans
+HOYA_ARCH_CHIPSETS := kodiak lemans monaco
 BOBCAT_ARCH_CHIPSETS := ipq96xx ipq52xx
-WILDCAT_ARCH_CHIPSETS := nord
+WILDCAT_ARCH_CHIPSETS := nord cacao
+BRUIN_ARCH_CHIPSETS := shikra
 
 ifneq (,$(filter $(PLATFORM_FLAVOR),$(HOYA_ARCH_CHIPSETS)))
 QCOM_ARCH_FAMILY := hoya
@@ -43,6 +44,8 @@ else ifneq (,$(filter $(PLATFORM_FLAVOR),$(BOBCAT_ARCH_CHIPSETS)))
 QCOM_ARCH_FAMILY := bobcat
 else ifneq (,$(filter $(PLATFORM_FLAVOR),$(WILDCAT_ARCH_CHIPSETS)))
 QCOM_ARCH_FAMILY := wildcat
+else ifneq (,$(filter $(PLATFORM_FLAVOR),$(BRUIN_ARCH_CHIPSETS)))
+QCOM_ARCH_FAMILY := bruin
 else
 $(error Unsupported PLATFORM_FLAVOR: $(PLATFORM_FLAVOR))
 endif

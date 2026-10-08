@@ -8,6 +8,7 @@ srcs-$(CFG_RISCV_SBI_CONSOLE) += sbi_console.c
 srcs-$(CFG_RISCV_SBI_MPXY) += sbi_mpxy.c
 srcs-$(CFG_RISCV_SBI_MPXY_RPMI) += sbi_mpxy_rpmi.c
 srcs-y += boot.c
+srcs-y += hart.c
 srcs-y += entry.S
 srcs-y += abort.c
 srcs-y += thread_rv.S
@@ -18,6 +19,8 @@ srcs-$(CFG_UNWIND) += unwind_rv.c
 srcs-$(CFG_SEMIHOSTING) += semihosting_rv.S
 srcs-y += thread_optee_abi.c
 srcs-y += thread_optee_abi_rv.S
+srcs-$(CFG_WITH_VFP) += vfp.c
+srcs-$(CFG_WITH_VFP) += vfp_rv.S
 asm-defines-y += asm-defines.c
 
 ifeq ($(CFG_SYSCALL_FTRACE),y)

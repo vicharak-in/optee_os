@@ -7,6 +7,10 @@
 #include <crypto/crypto.h>
 #include <crypto/crypto_impl.h>
 #include <drivers/amd/asu_client.h>
+#include <drivers/amd/asu_crypto_common.h>
+#include <drivers/amd/asu_fw_info.h>
+#include <drivers/amd/asu_sharedmem.h>
+#include <drivers/amd/fw_compat.h>
 #include <drvcrypt.h>
 #include <drvcrypt_acipher.h>
 #include <initcall.h>
@@ -83,6 +87,10 @@
 #define ASU_RSA_KM_KEY_USE_CASE_ALL		7U
 #define ASU_RSA_KM_USAGE_COUNT_NON_DEPLETING	0xFFFFFFFFU
 #define ASU_RSA_KM_KEY_ATTR_PRIME_PRESENT	2U
+
+/* KeyManager first-error status code */
+#define ASU_RSA_FW_STATUS_CODE_MASK		0x3FFU
+#define ASU_RSA_KM_KEY_NOT_FOUND		0x1BCU
 
 /* Public key payload expected by ASU FW */
 struct asu_rsa_pub_key_comp {
@@ -169,12 +177,95 @@ struct asu_rsa_km_params {
 	uint8_t reserved[4];
 };
 
+/* Public exponent prefix size in the KeyManager key-pair object */
+#define ASU_RSA_KM_PUBEXP_SIZE_IN_BYTES		4U
+
+/*
+ * Cached ASUFW RSA module compatibility, populated once by
+ * asu_rsa_check_fw_compat() at driver_init() from the fw_compat_check()
+ * snapshot. @hw_available is false when the RSA module version is below
+ * CFG_AMD_ASU_RSA_MINVER_MAJ/_MNR, in which case every
+ * operation below falls back to software regardless of @feature_caps.
+ */
+static struct {
+	bool hw_available;
+	uint16_t feature_caps;
+} asu_rsa_fw_caps;
+
+/*
+ * asu_rsa_check_fw_compat() - Validate the ASU RSA and KeyManager module
+ * versions and cache RSA's FeatureCaps
+ *
+ * RSA hardware key-pair generation requires KeyManager. Use software
+ * fallback unless both modules meet their minimum versions.
+ */
+static void asu_rsa_check_fw_compat(void)
+{
+	const struct fw_module_info *rsa_mod = NULL;
+	const struct fw_module_info *km_mod = NULL;
+
+	rsa_mod = fw_compat_get_module_info(ASU_MODULE_RSA_ID);
+	if (!asu_module_version_at_least(rsa_mod, CFG_AMD_ASU_RSA_MINVER_MAJ,
+					 CFG_AMD_ASU_RSA_MINVER_MNR)) {
+		EMSG("ASU RSA module unavailable or below min %u.%u, using SW",
+		     CFG_AMD_ASU_RSA_MINVER_MAJ, CFG_AMD_ASU_RSA_MINVER_MNR);
+		return;
+	}
+
+	km_mod = fw_compat_get_module_info(ASU_MODULE_KEYMANAGER_ID);
+	if (!asu_module_version_at_least(km_mod,
+					 CFG_AMD_ASU_KEYMANAGER_MINVER_MAJ,
+					 CFG_AMD_ASU_KEYMANAGER_MINVER_MNR)) {
+		EMSG("ASU KeyManager unavailable or below min %u.%u, using SW",
+		     CFG_AMD_ASU_KEYMANAGER_MINVER_MAJ,
+		     CFG_AMD_ASU_KEYMANAGER_MINVER_MNR);
+		return;
+	}
+
+	asu_rsa_fw_caps.hw_available = true;
+	asu_rsa_fw_caps.feature_caps = rsa_mod->feature_caps;
+
+	IMSG("ASU RSA HW available, caps=%#"PRIx16, rsa_mod->feature_caps);
+}
+
+/* Whether HW-accelerated padded RSA (OAEP/PSS) operations can be used */
+static bool asu_rsa_hw_supports_padding(void)
+{
+	return asu_rsa_fw_caps.hw_available &&
+	       (asu_rsa_fw_caps.feature_caps & ASU_RSA_CAP_PADDING);
+}
+
+/* Whether HW-accelerated raw (NOPAD) RSA operations can be used */
+static bool asu_rsa_hw_supports_nopad(void)
+{
+	return asu_rsa_fw_caps.hw_available;
+}
+
+/* Whether HW RSA key-pair generation is available for a given key size */
+static bool asu_rsa_hw_supports_keygen(size_t size_bits)
+{
+	if (!asu_rsa_fw_caps.hw_available)
+		return false;
+
+	switch (size_bits) {
+	case 2048:
+		return asu_rsa_fw_caps.feature_caps & ASU_RSA_CAP_2048_KEYGEN;
+	case 3072:
+		return asu_rsa_fw_caps.feature_caps & ASU_RSA_CAP_3072_KEYGEN;
+	case 4096:
+		return asu_rsa_fw_caps.feature_caps & ASU_RSA_CAP_4096_KEYGEN;
+	default:
+		return false;
+	}
+}
+
 /* Calculate the length of the RSA key-pair blob */
 static size_t asu_rsa_keypair_blob_len(size_t size_bytes)
 {
 	size_t prime_bytes = size_bytes / 2U;
 
-	return (size_bytes * 2U) + (prime_bytes * 5U);
+	return ASU_RSA_KM_PUBEXP_SIZE_IN_BYTES + (size_bytes * 2U) +
+	       (prime_bytes * 5U);
 }
 
 /*
@@ -300,6 +391,19 @@ static TEE_Result asu_rsa_sha_cfg_from_hash_algo(uint32_t hash_algo,
 	}
 
 	return TEE_SUCCESS;
+}
+
+/*
+ * asu_rsa_sha_module_id() - Map ASU RSA SHA family to the SHA engine module.
+ *
+ * OAEP and PSS commands in ASUFW allocate SHA2 or SHA3 for the whole request.
+ */
+static uint8_t asu_rsa_sha_module_id(uint8_t sha_type)
+{
+	if (sha_type == ASU_RSA_SHA2_TYPE)
+		return ASU_MODULE_SHA2_ID;
+
+	return ASU_MODULE_SHA3_ID;
 }
 
 /*
@@ -649,7 +753,6 @@ asu_rsa_import_generated_keypair(struct rsa_keypair *key,
 				 size_t size_bytes,
 				 uint8_t *obj)
 {
-	const uint8_t e_f4[] = { 0x01U, 0x00U, 0x01U };
 	size_t prime_bytes = size_bytes / 2U;
 	size_t keyobj_len = asu_rsa_keypair_blob_len(size_bytes);
 	uint8_t *p = obj;
@@ -660,6 +763,11 @@ asu_rsa_import_generated_keypair(struct rsa_keypair *key,
 
 	if (keyobj_len > asu_rsa_keypair_blob_len(ASU_RSA_MAX_MOD_LEN))
 		return TEE_ERROR_BAD_PARAMETERS;
+
+	ret = crypto_bignum_bin2bn(p, ASU_RSA_KM_PUBEXP_SIZE_IN_BYTES, key->e);
+	if (ret)
+		return ret;
+	p += ASU_RSA_KM_PUBEXP_SIZE_IN_BYTES;
 
 	ret = crypto_bignum_bin2bn(p, size_bytes, key->n);
 	if (ret)
@@ -692,10 +800,6 @@ asu_rsa_import_generated_keypair(struct rsa_keypair *key,
 	p += prime_bytes;
 
 	ret = crypto_bignum_bin2bn(p, prime_bytes, key->qp);
-	if (ret)
-		return ret;
-
-	ret = crypto_bignum_bin2bn(e_f4, sizeof(e_f4), key->e);
 
 	return ret;
 }
@@ -1003,34 +1107,6 @@ static TEE_Result asu_rsa_sw_rsanopad_decrypt(struct drvcrypt_rsa_ed *rsa_data)
 }
 
 /*
- * asu_rsa_sw_rsassa_sign() - Software fallback for RSASSA sign
- * @ssa_data: RSASSA sign operation context
- *
- * Return: TEE result code from software crypto backend.
- */
-static TEE_Result asu_rsa_sw_rsassa_sign(struct drvcrypt_rsa_ssa *ssa_data)
-{
-	return sw_crypto_acipher_rsassa_sign(ssa_data->algo,
-			ssa_data->key.key, ssa_data->salt_len,
-			ssa_data->message.data, ssa_data->message.length,
-			ssa_data->signature.data, &ssa_data->signature.length);
-}
-
-/*
- * asu_rsa_sw_rsassa_verify() - Software fallback for RSASSA verify
- * @ssa_data: RSASSA verify operation context
- *
- * Return: TEE result code from software crypto backend.
- */
-static TEE_Result asu_rsa_sw_rsassa_verify(struct drvcrypt_rsa_ssa *ssa_data)
-{
-	return sw_crypto_acipher_rsassa_verify(ssa_data->algo,
-			ssa_data->key.key, ssa_data->salt_len,
-			ssa_data->message.data, ssa_data->message.length,
-			ssa_data->signature.data, ssa_data->signature.length);
-}
-
-/*
  * asu_rsa_prepare_input_buf() - Allocate and prepare input buffer for
  * ASU command
  * @src: Source input data
@@ -1163,7 +1239,9 @@ static TEE_Result asu_rsa_encrypt(struct drvcrypt_rsa_ed *rsa_data)
 	uint8_t *out_buf = NULL;
 	uint8_t *label_buf = NULL;
 	size_t label_len = 0;
+	size_t em_len = 0;
 	bool use_oaep = false;
+	bool sha_acquired = false;
 	uint8_t sha_type = 0;
 	uint8_t sha_mode = 0;
 	uint32_t expected_mgf_algo = 0;
@@ -1199,10 +1277,17 @@ static TEE_Result asu_rsa_encrypt(struct drvcrypt_rsa_ed *rsa_data)
 			ret = asu_rsa_sw_rsaes_encrypt(rsa_data);
 			goto out;
 		}
-		if (asu_rsa_validate_key_size(rsa_data->key.n_size)) {
+		if (asu_rsa_validate_key_size(rsa_data->key.n_size) ||
+		    !asu_rsa_hw_supports_padding()) {
 			ret = asu_rsa_sw_rsaes_encrypt(rsa_data);
 			goto out;
 		}
+		ret = asu_shadev_acquire(asu_rsa_sha_module_id(sha_type));
+		if (ret) {
+			ret = asu_rsa_sw_rsaes_encrypt(rsa_data);
+			goto out;
+		}
+		sha_acquired = true;
 		use_oaep = true;
 		break;
 	case DRVCRYPT_RSA_NOPAD:
@@ -1211,7 +1296,8 @@ static TEE_Result asu_rsa_encrypt(struct drvcrypt_rsa_ed *rsa_data)
 			goto out;
 		}
 
-		if (asu_rsa_validate_key_size(rsa_data->key.n_size)) {
+		if (asu_rsa_validate_key_size(rsa_data->key.n_size) ||
+		    !asu_rsa_hw_supports_nopad()) {
 			ret = asu_rsa_sw_rsanopad_encrypt(rsa_data);
 			goto out;
 		}
@@ -1223,7 +1309,24 @@ static TEE_Result asu_rsa_encrypt(struct drvcrypt_rsa_ed *rsa_data)
 			ret = TEE_ERROR_BAD_PARAMETERS;
 			goto out;
 		}
+
+		/*
+		 * The caller already built the EM, so this is a plain modexp.
+		 * rsanopad strips leading zeros from the result, but the SSA
+		 * path needs the EM at full width, so pad them back.
+		 */
+		em_len = rsa_data->cipher.length;
+
 		ret = asu_rsa_sw_rsanopad_encrypt(rsa_data);
+		if (!ret && rsa_data->cipher.length < em_len) {
+			size_t pad = em_len - rsa_data->cipher.length;
+
+			memmove(rsa_data->cipher.data + pad,
+				rsa_data->cipher.data,
+				rsa_data->cipher.length);
+			memset(rsa_data->cipher.data, 0, pad);
+			rsa_data->cipher.length = em_len;
+		}
 		goto out;
 	default:
 		DMSG("Unsupported rsa_id=%d", rsa_data->rsa_id);
@@ -1303,6 +1406,8 @@ static TEE_Result asu_rsa_encrypt(struct drvcrypt_rsa_ed *rsa_data)
 	DMSG("RSA encryption successful");
 
 out:
+	if (sha_acquired)
+		asu_shadev_release(asu_rsa_sha_module_id(sha_type));
 	free_wipe(msg_buf);
 	free_wipe(out_buf);
 	free_wipe(label_buf);
@@ -1327,7 +1432,9 @@ static TEE_Result asu_rsa_decrypt(struct drvcrypt_rsa_ed *rsa_data)
 	uint8_t *label_buf = NULL;
 	uint32_t *fw_output_len_buf = NULL;
 	size_t label_len = 0;
+	size_t sig_len = 0;
 	bool use_oaep = false;
+	bool sha_acquired = false;
 	uint8_t sha_type = 0;
 	uint8_t sha_mode = 0;
 	uint32_t expected_mgf_algo = 0;
@@ -1370,10 +1477,17 @@ static TEE_Result asu_rsa_decrypt(struct drvcrypt_rsa_ed *rsa_data)
 			ret = TEE_ERROR_BAD_PARAMETERS;
 			goto out;
 		}
-		if (asu_rsa_validate_key_size(rsa_data->key.n_size)) {
+		if (asu_rsa_validate_key_size(rsa_data->key.n_size) ||
+		    !asu_rsa_hw_supports_padding()) {
 			ret = asu_rsa_sw_rsaes_decrypt(rsa_data);
 			goto out;
 		}
+		ret = asu_shadev_acquire(asu_rsa_sha_module_id(sha_type));
+		if (ret) {
+			ret = asu_rsa_sw_rsaes_decrypt(rsa_data);
+			goto out;
+		}
+		sha_acquired = true;
 		use_oaep = true;
 		break;
 	case DRVCRYPT_RSA_NOPAD:
@@ -1383,7 +1497,8 @@ static TEE_Result asu_rsa_decrypt(struct drvcrypt_rsa_ed *rsa_data)
 		}
 
 		if (asu_rsa_validate_key_size(rsa_data->key.n_size) ||
-		    rsa_data->cipher.length != rsa_data->key.n_size) {
+		    rsa_data->cipher.length != rsa_data->key.n_size ||
+		    !asu_rsa_hw_supports_nopad()) {
 			ret = asu_rsa_sw_rsanopad_decrypt(rsa_data);
 			goto out;
 		}
@@ -1394,11 +1509,27 @@ static TEE_Result asu_rsa_decrypt(struct drvcrypt_rsa_ed *rsa_data)
 			ret = TEE_ERROR_BAD_PARAMETERS;
 			goto out;
 		}
+
+		/*
+		 * Same restoration as asu_rsa_encrypt(): callers require a
+		 * fixed-width signature.
+		 */
+		sig_len = rsa_data->message.length;
+
 		ret = asu_rsa_sw_rsanopad_decrypt(rsa_data);
+		if (!ret && rsa_data->message.length < sig_len) {
+			size_t pad = sig_len - rsa_data->message.length;
+
+			memmove(rsa_data->message.data + pad,
+				rsa_data->message.data,
+				rsa_data->message.length);
+			memset(rsa_data->message.data, 0, pad);
+			rsa_data->message.length = sig_len;
+		}
 		goto out;
 	default:
 		DMSG("Unsupported rsa_id=%d", rsa_data->rsa_id);
-		ret = TEE_ERROR_NOT_SUPPORTED;
+		ret = TEE_ERROR_NOT_IMPLEMENTED;
 		goto out;
 	}
 
@@ -1537,6 +1668,8 @@ static TEE_Result asu_rsa_decrypt(struct drvcrypt_rsa_ed *rsa_data)
 	DMSG("RSA decryption successful");
 
 out:
+	if (sha_acquired)
+		asu_shadev_release(asu_rsa_sha_module_id(sha_type));
 	free_wipe(cipher_buf);
 	free_wipe(out_buf);
 	free_wipe(label_buf);
@@ -1563,6 +1696,7 @@ static TEE_Result asu_rsa_ssa_sign(struct drvcrypt_rsa_ssa *ssa_data)
 	uint32_t key_size = 0;
 	uint32_t input_len = 0;
 	uint32_t output_len = 0;
+	bool sha_acquired = false;
 	TEE_Result ret = TEE_SUCCESS;
 
 	if (!ssa_data || !ssa_data->key.key) {
@@ -1588,16 +1722,18 @@ static TEE_Result asu_rsa_ssa_sign(struct drvcrypt_rsa_ssa *ssa_data)
 	case TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA1:
 	case TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA224:
 	case TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA3_224:
-		ret = asu_rsa_sw_rsassa_sign(ssa_data);
+		/* Let the framework fall back, so sign and verify agree */
+		ret = TEE_ERROR_NOT_IMPLEMENTED;
 		goto out;
 	default:
 		DMSG("Unsupported algo=0x%"PRIx32, ssa_data->algo);
-		ret = TEE_ERROR_NOT_SUPPORTED;
+		ret = TEE_ERROR_NOT_IMPLEMENTED;
 		goto out;
 	}
 
-	if (asu_rsa_validate_key_size(ssa_data->key.n_size)) {
-		ret = asu_rsa_sw_rsassa_sign(ssa_data);
+	if (asu_rsa_validate_key_size(ssa_data->key.n_size) ||
+	    !asu_rsa_hw_supports_padding()) {
+		ret = TEE_ERROR_NOT_IMPLEMENTED;
 		goto out;
 	}
 
@@ -1608,12 +1744,6 @@ static TEE_Result asu_rsa_ssa_sign(struct drvcrypt_rsa_ssa *ssa_data)
 		goto out;
 	}
 
-	key_comp = asu_rsa_alloc_align_buf(sizeof(*key_comp));
-	if (!key_comp) {
-		ret = TEE_ERROR_OUT_OF_MEMORY;
-		goto out;
-	}
-
 	ret = asu_rsa_sha_cfg_from_hash_algo(ssa_data->hash_algo,
 					     &sha_type, &sha_mode);
 	if (ret) {
@@ -1621,6 +1751,18 @@ static TEE_Result asu_rsa_ssa_sign(struct drvcrypt_rsa_ssa *ssa_data)
 		     ret, ssa_data->hash_algo);
 		goto out;
 	}
+
+	ret = asu_shadev_acquire(asu_rsa_sha_module_id(sha_type));
+	if (ret)
+		goto out;
+	sha_acquired = true;
+
+	key_comp = asu_rsa_alloc_align_buf(sizeof(*key_comp));
+	if (!key_comp) {
+		ret = TEE_ERROR_OUT_OF_MEMORY;
+		goto out;
+	}
+
 	ret = asu_rsa_pack_private_key(ssa_data->key.key, ssa_data->key.n_size,
 				       key_comp);
 	if (ret) {
@@ -1667,6 +1809,8 @@ static TEE_Result asu_rsa_ssa_sign(struct drvcrypt_rsa_ssa *ssa_data)
 	DMSG("RSA signing successful");
 
 out:
+	if (sha_acquired)
+		asu_shadev_release(asu_rsa_sha_module_id(sha_type));
 	free_wipe(msg_buf);
 	free_wipe(sig_buf);
 	free_wipe(key_comp);
@@ -1692,6 +1836,7 @@ static TEE_Result asu_rsa_ssa_verify(struct drvcrypt_rsa_ssa *ssa_data)
 	uint32_t key_size = 0;
 	uint32_t input_len = 0;
 	uint32_t output_len = 0;
+	bool sha_acquired = false;
 	TEE_Result ret = TEE_SUCCESS;
 
 	if (!ssa_data || !ssa_data->key.key) {
@@ -1717,7 +1862,12 @@ static TEE_Result asu_rsa_ssa_verify(struct drvcrypt_rsa_ssa *ssa_data)
 	case TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA1:
 	case TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA224:
 	case TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA3_224:
-		ret = asu_rsa_sw_rsassa_verify(ssa_data);
+		/*
+		 * Let the framework fall back. Calling
+		 * sw_crypto_acipher_rsassa_verify() here would complete the
+		 * FTMN linked call twice and assert on every TA load.
+		 */
+		ret = TEE_ERROR_NOT_IMPLEMENTED;
 		goto out;
 	default:
 		DMSG("Unsupported algo=0x%"PRIx32, ssa_data->algo);
@@ -1725,14 +1875,10 @@ static TEE_Result asu_rsa_ssa_verify(struct drvcrypt_rsa_ssa *ssa_data)
 		goto out;
 	}
 
-	if (asu_rsa_validate_key_size(ssa_data->key.n_size)) {
-		ret = asu_rsa_sw_rsassa_verify(ssa_data);
-		goto out;
-	}
-
-	key_comp = asu_rsa_alloc_align_buf(sizeof(*key_comp));
-	if (!key_comp) {
-		ret = TEE_ERROR_OUT_OF_MEMORY;
+	if (asu_rsa_validate_key_size(ssa_data->key.n_size) ||
+	    !asu_rsa_hw_supports_padding()) {
+		/* Let the framework fall back, see the note above */
+		ret = TEE_ERROR_NOT_IMPLEMENTED;
 		goto out;
 	}
 
@@ -1743,6 +1889,18 @@ static TEE_Result asu_rsa_ssa_verify(struct drvcrypt_rsa_ssa *ssa_data)
 		     ret, ssa_data->hash_algo);
 		goto out;
 	}
+
+	ret = asu_shadev_acquire(asu_rsa_sha_module_id(sha_type));
+	if (ret)
+		goto out;
+	sha_acquired = true;
+
+	key_comp = asu_rsa_alloc_align_buf(sizeof(*key_comp));
+	if (!key_comp) {
+		ret = TEE_ERROR_OUT_OF_MEMORY;
+		goto out;
+	}
+
 	ret = asu_rsa_pack_public_key(ssa_data->key.key, ssa_data->key.n_size,
 				      key_comp);
 	if (ret) {
@@ -1787,6 +1945,8 @@ static TEE_Result asu_rsa_ssa_verify(struct drvcrypt_rsa_ssa *ssa_data)
 		DMSG("RSA signature verification successful");
 
 out:
+	if (sha_acquired)
+		asu_shadev_release(asu_rsa_sha_module_id(sha_type));
 	free_wipe(msg_buf);
 	free_wipe(sig_buf);
 	free_wipe(key_comp);
@@ -1819,7 +1979,8 @@ static TEE_Result asu_rsa_gen_keypair(struct rsa_keypair *key,
 		return TEE_ERROR_BAD_PARAMETERS;
 
 	if (asu_rsa_size_bits_to_bytes(size_bits, &size_bytes) ||
-	    asu_rsa_pubexp_is_f4(key->e))
+	    asu_rsa_pubexp_is_f4(key->e) ||
+	    !asu_rsa_hw_supports_keygen(size_bits))
 		return sw_crypto_acipher_gen_rsa_key(key, size_bits);
 
 	key_obj_req_len = asu_rsa_keypair_blob_len(size_bytes);
@@ -1848,9 +2009,17 @@ static TEE_Result asu_rsa_gen_keypair(struct rsa_keypair *key,
 			       ASU_KM_GEN_RSA_KEY_PAIR_CMD_ID,
 			       NULL, &fw_status);
 	if (ret) {
-		DMSG("HW key-pair unavailable status=0x%08"PRIx32
-		     ", using SW fallback", fw_status);
-		ret = sw_crypto_acipher_gen_rsa_key(key, size_bits);
+		/* Fall back to SW only when the key vault is empty */
+		if ((fw_status & ASU_RSA_FW_STATUS_CODE_MASK) ==
+		    ASU_RSA_KM_KEY_NOT_FOUND) {
+			DMSG("HW key vault empty status=0x%08"PRIx32
+			     ", using SW fallback", fw_status);
+			ret = sw_crypto_acipher_gen_rsa_key(key, size_bits);
+			goto out;
+		}
+
+		EMSG("ASU KeyManager key-pair gen failed ret=%#"PRIx32
+		     " status=0x%08"PRIx32, ret, fw_status);
 		goto out;
 	}
 
@@ -1990,6 +2159,8 @@ static struct drvcrypt_rsa driver_rsa = {
 static TEE_Result asu_rsa_init(void)
 {
 	TEE_Result ret = TEE_SUCCESS;
+
+	asu_rsa_check_fw_compat();
 
 	ret = drvcrypt_register_rsa(&driver_rsa);
 	if (ret) {

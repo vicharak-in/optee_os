@@ -6,12 +6,14 @@
 
 #include <assert.h>
 #include <drivers/amd/asu_client.h>
+#include <drivers/amd/asu_crypto_common.h>
+#include <drivers/amd/asu_fw_info.h>
+#include <drivers/amd/fw_compat.h>
 #include <drvcrypt_hash.h>
 #include <drvcrypt_mac.h>
 #include <initcall.h>
 #include <io.h>
 #include <kernel/cache_helpers.h>
-#include <kernel/mutex.h>
 #include <kernel/panic.h>
 #include <kernel/unwind.h>
 #include <malloc.h>
@@ -36,6 +38,10 @@
 #define ASU_SHA_UPDATE				0x2U
 #define ASU_SHA_FINISH				0x4U
 
+/* SHAKE256 XOF continuation flag */
+#define ASU_SHA_NEXT_XOF_DISABLE		0U
+#define ASU_SHA_NEXT_XOF_ENABLE			1U
+
 /* SHA hash lengths */
 #define ASU_SHA_256_HASH_LEN			32U
 #define ASU_SHA_384_HASH_LEN			48U
@@ -43,8 +49,6 @@
 #define ASU_SHAKE_256_HASH_LEN			32U
 #define ASU_SHAKE_256_MAX_HASH_LEN		136U
 #define ASU_DATA_CHUNK_LEN			4096U
-
-#define ASU_DMA_ALIGNMENT			64U
 
 #if defined(CFG_AMD_ASU_HMAC)
 /* HMAC command IDs (used as cmdid in asu_create_header) */
@@ -63,13 +67,6 @@
 #define ASU_HMAC_MAX_KEY_LEN			1024U
 #endif /* CFG_AMD_ASU_HMAC */
 
-struct asu_shadev {
-	bool sha2_available;
-	bool sha3_available;
-	/* Control access to engine*/
-	struct mutex engine_lock;
-};
-
 struct asu_sha_op_cmd {
 	uint64_t dataaddr;
 	uint64_t hashaddr;
@@ -78,7 +75,7 @@ struct asu_sha_op_cmd {
 	uint8_t shamode;
 	uint8_t islast;
 	uint8_t opflags;
-	uint8_t shakereserved;
+	uint8_t xofenableflag;
 };
 
 struct asu_hash_ctx {
@@ -88,6 +85,7 @@ struct asu_hash_ctx {
 	uint32_t shastart;
 	uint8_t uniqueid;
 	uint8_t module;
+	bool initialized;
 };
 
 #if defined(CFG_AMD_ASU_HMAC)
@@ -124,10 +122,9 @@ struct asu_hmac_ctx {
 	uint8_t cmdid;
 	uint8_t hmacstart;
 	uint8_t uniqueid;
+	bool initialized;
 };
 #endif /* CFG_AMD_ASU_HMAC */
-
-static struct asu_shadev *asu_shadev;
 
 static const struct crypto_hash_ops asu_hash_ops;
 static struct asu_hash_ctx *to_hash_ctx(struct crypto_hash_ctx *ctx);
@@ -136,48 +133,6 @@ static struct asu_hash_ctx *to_hash_ctx(struct crypto_hash_ctx *ctx);
 static const struct crypto_mac_ops asu_hmac_ops;
 static struct asu_hmac_ctx *to_hmac_ctx(struct crypto_mac_ctx *ctx);
 #endif /* CFG_AMD_ASU_HMAC */
-
-/*
- * asu_shadev_acquire() - Claim a SHA engine slot by module ID.
- * @module: ASU_MODULE_SHA2_ID or ASU_MODULE_SHA3_ID
- *
- * Return: TEE_SUCCESS if the slot was free and is now claimed,
- *         TEE_ERROR_NOT_IMPLEMENTED if the slot is already in use.
- */
-static TEE_Result asu_shadev_acquire(uint8_t module)
-{
-	TEE_Result ret = TEE_SUCCESS;
-
-	mutex_lock(&asu_shadev->engine_lock);
-	if (module == ASU_MODULE_SHA2_ID && asu_shadev->sha2_available) {
-		asu_shadev->sha2_available = false;
-	} else if (module == ASU_MODULE_SHA3_ID && asu_shadev->sha3_available) {
-		asu_shadev->sha3_available = false;
-	} else {
-		/* Engine busy; fallback to sw */
-		ret = TEE_ERROR_NOT_IMPLEMENTED;
-	}
-	mutex_unlock(&asu_shadev->engine_lock);
-
-	return ret;
-}
-
-/*
- * asu_shadev_release() - Release a previously claimed SHA engine slot.
- * @module: ASU_MODULE_SHA2_ID or ASU_MODULE_SHA3_ID
- */
-static void asu_shadev_release(uint8_t module)
-{
-	mutex_lock(&asu_shadev->engine_lock);
-	if (module == ASU_MODULE_SHA2_ID) {
-		assert(!asu_shadev->sha2_available);
-		asu_shadev->sha2_available = true;
-	} else if (module == ASU_MODULE_SHA3_ID) {
-		assert(!asu_shadev->sha3_available);
-		asu_shadev->sha3_available = true;
-	}
-	mutex_unlock(&asu_shadev->engine_lock);
-}
 
 /* ---- SHA hash functions ---- */
 
@@ -221,6 +176,10 @@ static TEE_Result asu_hash_get_alg(uint32_t algo,
 	case TEE_ALG_SHA3_512:
 		*module = ASU_MODULE_SHA3_ID;
 		*mode = ASU_SHA_MODE_SHA512;
+		break;
+	case TEE_ALG_SHAKE256:
+		*module = ASU_MODULE_SHA3_ID;
+		*mode = ASU_SHA_MODE_SHAKE256;
 		break;
 	default:
 		ret = TEE_ERROR_NOT_IMPLEMENTED;
@@ -296,6 +255,8 @@ static TEE_Result asu_hash_update(struct asu_hash_ctx *asu_hashctx,
 	TEE_Result ret = TEE_SUCCESS;
 	struct asu_sha_op_cmd op = {};
 	struct asu_client_params *cparam = NULL;
+	size_t cacheline_len = dcache_get_line_size();
+	uint8_t *dma_buf = NULL;
 	uint32_t remaining = 0;
 
 	/* Inputs of client request */
@@ -303,25 +264,39 @@ static TEE_Result asu_hash_update(struct asu_hash_ctx *asu_hashctx,
 	cparam->priority = ASU_PRIORITY_HIGH;
 	cparam->cbhandler = NULL;
 
-	/* Inputs of SHA request */
-	cache_operation(TEE_CACHEFLUSH, data, len);
+	/* Bounce copy: ASU DMA needs a physically contiguous buffer. */
+	dma_buf = memalign(cacheline_len, ASU_DATA_CHUNK_LEN);
+	if (!dma_buf) {
+		EMSG("Failed to allocate SHA data DMA buffer");
+		return TEE_ERROR_OUT_OF_MEMORY;
+	}
+
 	op.hashaddr = 0;
 	op.hashbufsize = 0;
 	op.shamode = asu_hashctx->shamode;
 	op.islast = 0;
+	op.dataaddr = virt_to_phys(dma_buf);
 	remaining = len;
 	while (remaining) {
 		op.datasize = MIN(remaining, ASU_DATA_CHUNK_LEN);
 		op.opflags = ASU_SHA_UPDATE | asu_hashctx->shastart;
-		op.dataaddr = virt_to_phys(data);
-		remaining -= op.datasize;
-		data += op.datasize;
+
+		memcpy(dma_buf, data, op.datasize);
+		cache_operation(TEE_CACHEFLUSH, dma_buf, op.datasize);
+
 		ret = asu_sha_op(asu_hashctx, &op, asu_hashctx->module);
-		if (ret)
+		if (ret) {
+			asu_hashctx->initialized = false;
 			break;
+		}
+
+		asu_hashctx->initialized = true;
 		asu_hashctx->shastart = 0;
+		data += op.datasize;
+		remaining -= op.datasize;
 	}
 
+	free(dma_buf);
 	return ret;
 }
 
@@ -365,6 +340,10 @@ static TEE_Result asu_hash_final(struct asu_hash_ctx *asu_hashctx,
 	struct asu_sha_op_cmd op = {};
 	struct asu_client_params *cparam = NULL;
 	uint8_t *dma_digest = NULL;
+	size_t cacheline_len = dcache_get_line_size();
+	size_t remaining = 0;
+	size_t offset = 0;
+	size_t block_len = 0;
 
 	if (!digest || len == 0)
 		return TEE_ERROR_BAD_PARAMETERS;
@@ -376,15 +355,19 @@ static TEE_Result asu_hash_final(struct asu_hash_ctx *asu_hashctx,
 	/* Inputs of SHA request */
 	op.dataaddr = 0;
 	op.datasize = 0;
-	op.hashbufsize = len;
-	if (asu_hashctx->shamode == ASU_SHA_MODE_SHA256)
+
+	if (asu_hashctx->shamode == ASU_SHA_MODE_SHAKE256)
+		op.hashbufsize = ASU_SHAKE_256_MAX_HASH_LEN;
+	else if (asu_hashctx->shamode == ASU_SHA_MODE_SHA256)
 		op.hashbufsize = ASU_SHA_256_HASH_LEN;
 	else if (asu_hashctx->shamode == ASU_SHA_MODE_SHA384)
 		op.hashbufsize = ASU_SHA_384_HASH_LEN;
 	else if (asu_hashctx->shamode == ASU_SHA_MODE_SHA512)
 		op.hashbufsize = ASU_SHA_512_HASH_LEN;
 
-	dma_digest = memalign(ASU_DMA_ALIGNMENT, op.hashbufsize);
+	/* Buffer sized for the largest possible digest (SHAKE256 XOF chunk) */
+	dma_digest = memalign(cacheline_len,
+			      ROUNDUP(op.hashbufsize, cacheline_len));
 	if (!dma_digest) {
 		EMSG("Failed to allocate DMA buffer for hash digest");
 		return TEE_ERROR_OUT_OF_MEMORY;
@@ -392,16 +375,41 @@ static TEE_Result asu_hash_final(struct asu_hash_ctx *asu_hashctx,
 
 	op.shamode = asu_hashctx->shamode;
 	op.islast = 1;
-	op.opflags = ASU_SHA_FINISH | asu_hashctx->shastart;
 	op.hashaddr = virt_to_phys(dma_digest);
-	cache_operation(TEE_CACHEFLUSH, dma_digest, op.hashbufsize);
-	ret = asu_sha_op(asu_hashctx, &op, asu_hashctx->module);
-	if (ret) {
-		EMSG("SHA final operation failed");
-		goto out;
+	if (asu_hashctx->shamode == ASU_SHA_MODE_SHAKE256)
+		remaining = len;
+	else
+		remaining = MIN(len, op.hashbufsize);
+	while (remaining) {
+		block_len = MIN(remaining, op.hashbufsize);
+		remaining -= block_len;
+		op.opflags = ASU_SHA_FINISH | asu_hashctx->shastart;
+		if (asu_hashctx->shamode == ASU_SHA_MODE_SHAKE256 && remaining)
+			op.xofenableflag = ASU_SHA_NEXT_XOF_ENABLE;
+		else
+			op.xofenableflag = ASU_SHA_NEXT_XOF_DISABLE;
+
+		cache_operation(TEE_CACHEFLUSH, dma_digest, block_len);
+		/*
+		 * FINISH (or IPI failure) releases the SHA resource in
+		 * ASUFW, except SHAKE256 XOF continuation.
+		 */
+		if (op.xofenableflag == ASU_SHA_NEXT_XOF_DISABLE)
+			asu_hashctx->initialized = false;
+		ret = asu_sha_op(asu_hashctx, &op, asu_hashctx->module);
+		if (ret) {
+			asu_hashctx->initialized = false;
+			EMSG("SHA final operation failed");
+			goto out;
+		}
+
+		cache_operation(TEE_CACHEINVALIDATE, dma_digest,
+				block_len);
+		memcpy(digest + offset, dma_digest, block_len);
+
+		asu_hashctx->shastart = 0;
+		offset += block_len;
 	}
-	cache_operation(TEE_CACHEINVALIDATE, dma_digest, op.hashbufsize);
-	memcpy(digest, dma_digest, op.hashbufsize);
 
 out:
 	free(dma_digest);
@@ -419,6 +427,55 @@ static TEE_Result asu_hash_do_final(struct crypto_hash_ctx *ctx,
 }
 
 /*
+ * asu_hash_free_engine() - Send FINISH with zero data to reset ASUFW SHA
+ * engine state when the client missed final.
+ */
+static void asu_hash_free_engine(struct asu_hash_ctx *asu_hashctx)
+{
+	struct asu_sha_op_cmd op = {};
+	uint8_t *dma_digest = NULL;
+	size_t cacheline_len = dcache_get_line_size();
+	TEE_Result ret = TEE_SUCCESS;
+
+	if (asu_hashctx->shamode == ASU_SHA_MODE_SHAKE256)
+		op.hashbufsize = ASU_SHAKE_256_MAX_HASH_LEN;
+	else if (asu_hashctx->shamode == ASU_SHA_MODE_SHA256)
+		op.hashbufsize = ASU_SHA_256_HASH_LEN;
+	else if (asu_hashctx->shamode == ASU_SHA_MODE_SHA384)
+		op.hashbufsize = ASU_SHA_384_HASH_LEN;
+	else if (asu_hashctx->shamode == ASU_SHA_MODE_SHA512)
+		op.hashbufsize = ASU_SHA_512_HASH_LEN;
+
+	dma_digest = memalign(cacheline_len,
+			      ROUNDUP(op.hashbufsize, cacheline_len));
+
+	asu_hashctx->cparam.priority = ASU_PRIORITY_HIGH;
+	asu_hashctx->cparam.cbhandler = NULL;
+	op.shamode = asu_hashctx->shamode;
+	op.islast = 1;
+	op.opflags = ASU_SHA_FINISH;
+	op.xofenableflag = ASU_SHA_NEXT_XOF_DISABLE;
+	if (dma_digest) {
+		op.hashaddr = virt_to_phys(dma_digest);
+		cache_operation(TEE_CACHEFLUSH, dma_digest, op.hashbufsize);
+	}
+
+	/*
+	 * ASUFW releases the SHA resource on FINISH or any IPI failure,
+	 * so still send even if the digest bounce buffer could not be
+	 * allocated.
+	 */
+	ret = asu_sha_op(asu_hashctx, &op, asu_hashctx->module);
+	asu_hashctx->initialized = false;
+	free(dma_digest);
+
+	if (ret) {
+		DMSG("fw had reset the engine on IPI failure as required.");
+		DMSG("Still we should not reach here.");
+	}
+}
+
+/*
  * asu_hash_ctx_free() - Free Private context.
  * @crypto_hash_ctx: crypto context used by the crypto_hash_*() functions
  * Release crypto engine and free private context memory.
@@ -429,6 +486,9 @@ static TEE_Result asu_hash_do_final(struct crypto_hash_ctx *ctx,
 static void asu_hash_ctx_free(struct crypto_hash_ctx *ctx)
 {
 	struct asu_hash_ctx *asu_hashctx = to_hash_ctx(ctx);
+
+	if (asu_hashctx->initialized)
+		asu_hash_free_engine(asu_hashctx);
 
 	asu_free_unique_id(asu_hashctx->uniqueid);
 	asu_hashctx->uniqueid = ASU_UNIQUE_ID_MAX;
@@ -493,6 +553,7 @@ static TEE_Result asu_hash_ctx_allocate(struct crypto_hash_ctx **ctx,
 
 	asu_hashctx->module = module;
 	asu_hashctx->shamode = shamode;
+	asu_hashctx->initialized = false;
 	asu_hashctx->uniqueid = asu_alloc_unique_id();
 
 	if (asu_hashctx->uniqueid == ASU_UNIQUE_ID_MAX) {
@@ -715,13 +776,15 @@ static TEE_Result asu_hmac_do_update(struct crypto_mac_ctx *ctx,
 		op.opflags = hmac_ctx->hmacstart | ASU_HMAC_OP_UPDATE;
 
 		memcpy(dma_buf, data, op.msglen);
-		cache_operation(TEE_CACHEFLUSH, dma_buf,
-				ROUNDUP(op.msglen, cacheline_len));
+		cache_operation(TEE_CACHEFLUSH, dma_buf, op.msglen);
 
 		ret = asu_hmac_send_cmd(hmac_ctx, &op);
-		if (ret)
+		if (ret) {
+			hmac_ctx->initialized = false;
 			break;
+		}
 
+		hmac_ctx->initialized = true;
 		hmac_ctx->hmacstart = 0;
 		data += op.msglen;
 		remaining -= op.msglen;
@@ -764,7 +827,7 @@ static TEE_Result asu_hmac_do_final(struct crypto_mac_ctx *ctx,
 	struct asu_hmac_op_cmd op = {};
 	TEE_Result ret = TEE_SUCCESS;
 
-	if (!digest || !len || len > hmac_ctx->hmaclen) {
+	if (!digest || !len) {
 		EMSG("Invalid HMAC output parameters");
 		return TEE_ERROR_BAD_PARAMETERS;
 	}
@@ -779,6 +842,7 @@ static TEE_Result asu_hmac_do_final(struct crypto_mac_ctx *ctx,
 
 	hmac_ctx->cparam.cbhandler = asu_hmac_result_cb;
 	hmac_ctx->cparam.cbptr = &hmac_ctx->result;
+	hmac_ctx->initialized = false;
 
 	ret = asu_hmac_send_cmd(hmac_ctx, &op);
 	hmac_ctx->cparam.cbhandler = NULL;
@@ -789,9 +853,36 @@ static TEE_Result asu_hmac_do_final(struct crypto_mac_ctx *ctx,
 		return ret;
 	}
 
-	memcpy(digest, hmac_ctx->result.buf, len);
+	memcpy(digest, hmac_ctx->result.buf, MIN(len, hmac_ctx->hmaclen));
 
 	return ret;
+}
+
+/*
+ * asu_hmac_free_engine() - Send FINISH to reset ASUFW HMAC/SHA engine state
+ * when the client missed final.
+ */
+static void asu_hmac_free_engine(struct asu_hmac_ctx *hmac_ctx)
+{
+	struct asu_hmac_op_cmd op = {};
+	TEE_Result ret = TEE_SUCCESS;
+
+	op.hmaclen = hmac_ctx->hmaclen;
+	op.shatype = hmac_ctx->shatype;
+	op.shamode = hmac_ctx->shamode;
+	op.islast = 1;
+	op.opflags = ASU_HMAC_OP_FINISH;
+	hmac_ctx->cparam.priority = ASU_PRIORITY_HIGH;
+	hmac_ctx->cparam.cbhandler = NULL;
+	hmac_ctx->cparam.cbptr = NULL;
+
+	ret = asu_hmac_send_cmd(hmac_ctx, &op);
+	hmac_ctx->initialized = false;
+
+	if (ret) {
+		DMSG("fw had reset the engine on IPI failure as required.");
+		DMSG("Still we should not reach here.");
+	}
 }
 
 /*
@@ -803,6 +894,9 @@ static void asu_hmac_do_free_ctx(struct crypto_mac_ctx *ctx)
 	struct asu_hmac_ctx *hmac_ctx = to_hmac_ctx(ctx);
 	uint8_t sha_module = (hmac_ctx->cmdid == ASU_HMAC_CMD_SHA2) ?
 			     ASU_MODULE_SHA2_ID : ASU_MODULE_SHA3_ID;
+
+	if (hmac_ctx->initialized)
+		asu_hmac_free_engine(hmac_ctx);
 
 	if (hmac_ctx->key_buf) {
 		free_wipe(hmac_ctx->key_buf);
@@ -831,8 +925,8 @@ static const struct crypto_mac_ops asu_hmac_ops = {
  * @ctx:  Output crypto MAC context
  * @algo: TEE HMAC algorithm identifier
  *
- * Acquires the shared SHA engine slot from asu_shadev so that HMAC and
- * hash operations are serialised on the same underlying hardware.
+ * Acquires the shared SHA engine slot so that HMAC, hash, and RSA
+ * padding operations are serialised on the same underlying hardware.
  *
  * Return: TEE_SUCCESS or error code
  */
@@ -870,6 +964,7 @@ static TEE_Result asu_hmac_ctx_allocate(struct crypto_mac_ctx **ctx,
 	hmac_ctx->shamode = shamode;
 	hmac_ctx->cmdid = cmdid;
 	hmac_ctx->hmaclen = hmaclen;
+	hmac_ctx->initialized = false;
 	hmac_ctx->cparam.priority = ASU_PRIORITY_HIGH;
 	hmac_ctx->uniqueid = asu_alloc_unique_id();
 
@@ -894,23 +989,53 @@ err_release_engine:
 
 #endif /* CFG_AMD_ASU_HMAC */
 
+static bool asu_module_fw_compatible(const char *name, uint32_t module_id,
+				     uint16_t min_major, uint16_t min_minor)
+{
+	const struct fw_module_info *mod = fw_compat_get_module_info(module_id);
+
+	if (!asu_module_version_at_least(mod, min_major, min_minor)) {
+		EMSG("ASU %s version below min %u.%u, skip HW registration",
+		     name, min_major, min_minor);
+		return false;
+	}
+
+	IMSG("ASU %s HW available", name);
+	return true;
+}
+
 static TEE_Result asu_hash_init(void)
 {
 	TEE_Result ret = TEE_SUCCESS;
 
-	asu_shadev = calloc(1, sizeof(*asu_shadev));
-	mutex_init(&asu_shadev->engine_lock);
-	asu_shadev->sha2_available = true;
-	asu_shadev->sha3_available = true;
-
-	ret = drvcrypt_register_hash(&asu_hash_ctx_allocate);
-	if (ret)
-		EMSG("ASU hash register to crypto fail ret=%#"PRIx32, ret);
+	if (!asu_module_fw_compatible("SHA2", ASU_MODULE_SHA2_ID,
+				      CFG_AMD_ASU_SHA2_MINVER_MAJ,
+				      CFG_AMD_ASU_SHA2_MINVER_MNR) ||
+	    !asu_module_fw_compatible("SHA3", ASU_MODULE_SHA3_ID,
+				      CFG_AMD_ASU_SHA3_MINVER_MAJ,
+				      CFG_AMD_ASU_SHA3_MINVER_MNR)) {
+		IMSG("ASU hash driver not registered, using SW fallback");
+	} else {
+		ret = drvcrypt_register_hash(asu_hash_ctx_allocate);
+		if (ret)
+			EMSG("ASU hash register to crypto fail ret=%#"PRIx32,
+			     ret);
+	}
 
 #if defined(CFG_AMD_ASU_HMAC)
-	ret = drvcrypt_register_hmac(asu_hmac_ctx_allocate);
-	if (ret)
-		EMSG("ASU HMAC register failed ret=%#"PRIx32, ret);
+	if (!asu_module_fw_compatible("HMAC", ASU_MODULE_HMAC_ID,
+				      CFG_AMD_ASU_HMAC_MINVER_MAJ,
+				      CFG_AMD_ASU_HMAC_MINVER_MNR)) {
+		IMSG("ASU HMAC driver not registered, using SW fallback");
+	} else {
+		TEE_Result hmac_ret =
+			drvcrypt_register_hmac(asu_hmac_ctx_allocate);
+
+		if (hmac_ret)
+			EMSG("ASU HMAC register failed ret=%#"PRIx32, hmac_ret);
+		if (!ret)
+			ret = hmac_ret;
+	}
 #endif
 
 	return ret;

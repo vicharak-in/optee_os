@@ -573,6 +573,22 @@ static TEE_Result rpmb_probe_next(struct rpmb_dev_info *dev_info)
 	return TEE_SUCCESS;
 }
 
+static TEE_Result rpmb_probe_select_cid(const struct tee_rpmb_ctx *ctx)
+{
+	struct rpmb_dev_info dev_info = { };
+	TEE_Result res = TEE_SUCCESS;
+
+	while (true) {
+		res = rpmb_probe_next(&dev_info);
+		if (res) {
+			EMSG("rpmb_probe_next error %#"PRIx32, res);
+			return res;
+		}
+		if (!memcmp(ctx->cid, dev_info.cid, RPMB_CID_SIZE))
+			return TEE_SUCCESS;
+	}
+}
+
 static bool is_zero(const uint8_t *buf, size_t size)
 {
 	size_t i;
@@ -1294,18 +1310,10 @@ static TEE_Result tee_rpmb_init(void)
 				return res;
 			return legacy_rpmb_init();
 		}
-		while (true) {
-			res = rpmb_probe_next(&dev_info);
-			if (res) {
-				DMSG("rpmb_probe_next error %#"PRIx32, res);
-				return res;
-			}
-			if (!memcmp(rpmb_ctx->cid, dev_info.cid,
-				    RPMB_CID_SIZE)) {
-				rpmb_ctx->reinit = false;
-				return TEE_SUCCESS;
-			}
-		}
+		res = rpmb_probe_select_cid(rpmb_ctx);
+		if (res == TEE_SUCCESS)
+			rpmb_ctx->reinit = false;
+		return res;
 	}
 
 	if (rpmb_ctx->key_verified)
@@ -1323,15 +1331,28 @@ next:
 	while (true) {
 		res = rpmb_probe_next(&dev_info);
 		if (res) {
-			if (have_cand) {
-				memcpy(rpmb_ctx, &cand, sizeof(*rpmb_ctx));
-
-				DMSG("RPMB INIT: Auth key not yet written");
-				res = tee_rpmb_write_and_verify_key();
-				if (res == TEE_SUCCESS)
-					goto done;
+			if (!have_cand) {
+				DMSG("rpmb_probe_next error %#"PRIx32, res);
+				return res;
 			}
-			DMSG("rpmb_probe_next error %#"PRIx32, res);
+
+			memcpy(rpmb_ctx, &cand, sizeof(*rpmb_ctx));
+
+			res = rpmb_probe_reset();
+			if (res)
+				return res;
+
+			res = rpmb_probe_select_cid(rpmb_ctx);
+			if (res) {
+				EMSG("Failed to reselect matched CID");
+				return res;
+			}
+
+			DMSG("RPMB INIT: Auth key not yet written");
+			res = tee_rpmb_write_and_verify_key();
+			if (res == TEE_SUCCESS)
+				goto done;
+
 			return res;
 		}
 
@@ -2751,7 +2772,8 @@ static TEE_Result rpmb_fs_write(struct tee_file_handle *tfh, size_t pos,
 		res = rpmb_fs_write_primitive((struct rpmb_file_handle *)tfh,
 					      pos, buf_core, size);
 	} else if (buf_user) {
-		uint32_t f = TEE_MEMORY_ACCESS_READ;
+		uint32_t f = TEE_MEMORY_ACCESS_READ |
+			     TEE_MEMORY_ACCESS_ANY_OWNER;
 
 		res = check_user_access(f, buf_user, size);
 		if (res)
@@ -2914,8 +2936,13 @@ static TEE_Result rpmb_fs_truncate(struct tee_file_handle *tfh, size_t length)
 			goto out;
 
 		mm = tee_mm_alloc(&p, newsize);
+		if (!mm) {
+			res = TEE_ERROR_STORAGE_NO_SPACE;
+			goto out;
+		}
+
 		newbuf = calloc(1, newsize);
-		if (!mm || !newbuf) {
+		if (!newbuf) {
 			res = TEE_ERROR_OUT_OF_MEMORY;
 			goto out;
 		}
@@ -3153,7 +3180,8 @@ static TEE_Result rpmb_fs_create(struct tee_pobj *po, bool overwrite,
 {
 	TEE_Result res;
 	size_t pos = 0;
-	struct rpmb_file_handle *fh = alloc_file_handle(po, po->temporary);
+	bool temporary = po->temporary || overwrite;
+	struct rpmb_file_handle *fh = alloc_file_handle(po, temporary);
 
 	/* One of data_core and data_user must be NULL */
 	assert(!data_core || !data_user);
@@ -3202,18 +3230,16 @@ static TEE_Result rpmb_fs_create(struct tee_pobj *po, bool overwrite,
 		}
 	}
 
-	if (po->temporary) {
+	if (temporary) {
 		/*
-		 * If it's a temporary filename (which it normally is)
-		 * rename into the final filename now that the file is
-		 * fully initialized.
+		 * Rename the fully initialized temporary file into place.
+		 * Always use a temporary file for overwrite, including when
+		 * another handle keeps the persistent object alive.
 		 */
-		po->temporary = false;
 		res = rpmb_fs_rename_internal(po, NULL, overwrite);
-		if (res) {
-			po->temporary = true;
+		if (res)
 			goto out;
-		}
+		po->temporary = false;
 		/* Update file handle after rename. */
 		create_filename(fh->filename, sizeof(fh->filename), po, false);
 	}

@@ -13,3 +13,5 @@
 !.gitignore
 !.github
 !.devcontainer
+config.bat
+node_modules
